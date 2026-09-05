@@ -532,6 +532,7 @@ class GroupedReduceBase(EpiOp):
         reduce_planes=1,
         fragment_reduced=False,
         output_layout: GroupedLocalReduceOutputLayout | None = None,
+        physical_span=1,
     ):
         super().__init__(name)
         if axis not in (0, 1):
@@ -550,6 +551,10 @@ class GroupedReduceBase(EpiOp):
             raise TypeError("multi-plane grouped reductions require callable combine and finalize")
         if not isinstance(fragment_reduced, bool):
             raise TypeError("fragment_reduced must be bool")
+        if physical_span not in (1, 2):
+            raise ValueError("grouped reduction physical_span must be 1 or 2")
+        if physical_span > 1 and (axis != 1 or reduce_planes != 1 or not isinstance(combine, str)):
+            raise ValueError("grouped physical spans support scalar axis-N named reductions only")
         if fragment_reduced and combine is None:
             raise ValueError("fragment_reduced requires a cross-fragment combine")
         self.axis = axis
@@ -559,6 +564,12 @@ class GroupedReduceBase(EpiOp):
         self.reduce_planes = reduce_planes
         self.fragment_reduced = fragment_reduced
         self.output_layout = output_layout
+        self.physical_span = physical_span
+
+    @property
+    def physical_group(self):
+        """Physical accumulator elements covered by one logical group."""
+        return self.group * self.physical_span
 
     def config_key(self):
         """Fail-closed identity for geometry, state algebra, and output layout.
@@ -579,6 +590,7 @@ class GroupedReduceBase(EpiOp):
                     "reduce_planes",
                     "fragment_reduced",
                     "output_layout",
+                    "physical_span",
                 }
             )
         )
@@ -596,11 +608,12 @@ class GroupedReduceBase(EpiOp):
             self.reduce_planes,
             self.fragment_reduced,
             None if self.output_layout is None else self.output_layout.cache_key(),
+            self.physical_span,
         )
 
     def supports_config(self, config) -> bool:
         """Whether a native GEMM config preserves the reduction and output layout."""
-        if not grouped_reduce_supports_config(config, self.axis, self.group):
+        if not grouped_reduce_supports_config(config, self.axis, self.physical_group):
             return False
         return (
             self.output_layout is None
@@ -616,7 +629,7 @@ class GroupedReduceBase(EpiOp):
             and not any(
                 self.output_layout.supports_config_fn(config, self.axis, self.group)
                 for config in configs
-                if grouped_reduce_supports_config(config, self.axis, self.group)
+                if grouped_reduce_supports_config(config, self.axis, self.physical_group)
             )
         ):
             return f"output layout {self.output_layout.name!r} has no supported GemmConfig"
@@ -714,7 +727,10 @@ class GroupedReduceBase(EpiOp):
             )
             raise ValueError(f"{self.name}: {kind} is required")
         self.host_arg_key(value)
-        dim = m if self.axis == 0 else n
+        if n % self.physical_span:
+            raise ValueError(f"{self.name}: physical span {self.physical_span} must divide N={n}")
+        logical_n = n // self.physical_span
+        dim = m if self.axis == 0 else logical_n
         physical_axis = 1 - self.axis if swap_ab else self.axis
         tile = tile_M if physical_axis == 0 else tile_N
         if dim % self.group:
@@ -722,17 +738,20 @@ class GroupedReduceBase(EpiOp):
                 f"{self.name}: group {self.group} must divide the grouped dim "
                 f"{dim} (axis={self.axis})"
             )
-        if tile % self.group or self.group > tile:
+        if tile % self.physical_group or self.physical_group > tile:
             raise ValueError(
-                f"{self.name}: group {self.group} must divide the CTA tile extent {tile}"
+                f"{self.name}: physical group {self.physical_group} must divide "
+                f"the CTA tile extent {tile}"
             )
         if self.output_layout is None:
-            expected = grouped_reduce_out_shape(m, n, self.group, self.axis, batch)
+            expected = grouped_reduce_out_shape(m, logical_n, self.group, self.axis, batch)
             actual = tuple(value.shape)
             if actual != expected:
                 raise ValueError(f"{self.name}: expected compressed shape {expected}, got {actual}")
             return
-        rows, cols = (m, n // self.group) if self.axis == 1 else (m // self.group, n)
+        rows, cols = (
+            (m, logical_n // self.group) if self.axis == 1 else (m // self.group, logical_n)
+        )
         expected = tuple(
             self.output_layout.carrier_shape_fn(
                 1 if batch is None else batch,
@@ -754,8 +773,11 @@ class GroupedReduceBase(EpiOp):
 
         dtype, ndim = key
         m, n = (fctx.n, fctx.m) if fctx.swapped else (fctx.m, fctx.n)
+        logical_n = n // self.physical_span
         if self.output_layout is not None:
-            rows, cols = (m, n // self.group) if self.axis == 1 else (m // self.group, n)
+            rows, cols = (
+                (m, logical_n // self.group) if self.axis == 1 else (m // self.group, logical_n)
+            )
             shape = self.output_layout.fake_shape_fn(fctx.l, rows, cols)
             return make_fake_tensor(
                 dtype,
@@ -764,7 +786,7 @@ class GroupedReduceBase(EpiOp):
                 divisibility=1,
             )
         groups = cute.sym_int()
-        inner = (m, groups) if self.axis == 1 else (groups, n)
+        inner = (m, groups) if self.axis == 1 else (groups, logical_n)
         shape = (fctx.l, *inner) if ndim == 3 else inner
         return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=1)
 
@@ -780,10 +802,11 @@ class GroupedReduceBase(EpiOp):
         if self.output_layout is not None:
             tensor = self.output_layout.tensor_fn(tensor, gemm.a_transposed)
             assert cute.rank(tensor) == 3
+            logical_n = gemm.caller_n // self.physical_span
             logical_extent, logical_groups = (
-                (gemm.caller_m, gemm.caller_n // self.group)
+                (gemm.caller_m, logical_n // self.group)
                 if self.axis == 1
-                else (gemm.caller_n, gemm.caller_m // self.group)
+                else (logical_n, gemm.caller_m // self.group)
             )
             return {self.name: _GroupedOutputLayoutParams(tensor, logical_extent, logical_groups)}
         if const_expr(gemm.a_transposed):
@@ -803,7 +826,7 @@ class GroupedReduceBase(EpiOp):
         so it conservatively reserves the buffer for any wide group. The traced
         instance keeps the buffer only when its physical axis is M.
         """
-        if self.group <= GROUPED_FRAGMENT_WIDTH:
+        if self.physical_group <= GROUPED_FRAGMENT_WIDTH:
             return False
         return gemm is None or self.physical_axis(gemm) == 0
 
@@ -851,8 +874,11 @@ class GroupedReduceBase(EpiOp):
             ctx.tidx,
             ctx.tiled_copy_t2r is None,
             self.physical_axis(gemm),
-            self.group,
+            self.physical_group,
         )
+        assert not (
+            self.fragment_reduced and self.physical_span > 1 and geom.fragments_per_group > 1
+        ), "fragment-reduced logical groups must fit one epilogue fragment"
         frag = None
         coord = None
         if const_expr(param is not None):
@@ -962,7 +988,7 @@ class GroupedReduceBase(EpiOp):
         tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
         axis = state.geom.axis
         tile = tile_M if const_expr(axis == 0) else tile_N
-        groups_per_cta = const_expr(tile // self.group)
+        groups_per_cta = const_expr(tile // self.physical_group)
         batch_idx = tile_coord_mnkl[3]
         if const_expr(cute.rank(param) == 3):
             mReduce = param[batch_idx, None, None]
@@ -992,17 +1018,17 @@ class GroupedReduceBase(EpiOp):
         # groups) — except after a temporal combine, which lands on the LAST
         # fragment of the group.
         leader_off = const_expr(
-            self.group - state.geom.cols if self._is_temporal(state.geom) else 0
+            self.physical_group - state.geom.cols if self._is_temporal(state.geom) else 0
         )
         tile_idx = tile_coord_mnkl[1] if const_expr(axis == 1) else tile_coord_mnkl[0]
         value_planes = self._state_planes(values)
         for i in cutlass.range(cute.size(coord), unroll_full=True):
             row_idx, n_idx = coord[i][0], coord[i][1]
             pos = n_idx if const_expr(axis == 1) else row_idx
-            group_idx = pos // self.group
+            group_idx = pos // self.physical_group
             in_bounds = (row_idx if const_expr(axis == 1) else n_idx) < limit
             if (
-                pos % self.group == leader_off
+                pos % self.physical_group == leader_off
                 and in_bounds
                 and tile_idx * groups_per_cta + group_idx < limit_groups
             ):
@@ -1030,7 +1056,11 @@ class GroupedLocalReduce(GroupedReduceBase):
     """
 
     fn_port = "sink"
-    supports_swap_ab = True
+
+    @property
+    def supports_swap_ab(self):
+        """Whether caller-axis geometry can be transposed physically."""
+        return self.physical_span == 1
 
     @cute.jit
     def fn_sink_flush(self, gemm, state, *fragments):
@@ -1038,7 +1068,17 @@ class GroupedLocalReduce(GroupedReduceBase):
         assert len(fragments) == self.reduce_planes
         destinations = self._state_planes(state.frag)
         for source, destination in zip(fragments, destinations):
-            cute.autovec_copy(source, destination)
+            if const_expr(self.physical_span == 1):
+                cute.autovec_copy(source, destination)
+                continue
+            source = cute.make_tensor(source.iterator, cute.make_layout(cute.size(source)))
+            paired = cute.flat_divide(destination, cute.make_layout(self.physical_span))
+            logical, unused = paired[0, ...], paired[1, ...]
+            assert cute.size(source) == cute.size(logical), (
+                "grouped physical-span source must match the logical destination"
+            )
+            cute.autovec_copy(source, logical)
+            unused.fill(const_expr(_COMBINE_IDENTITIES[self.combine]))
 
     @cute.jit
     def _fold_chunks(self, frag, chunks):
