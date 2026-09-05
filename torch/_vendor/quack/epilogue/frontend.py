@@ -58,8 +58,9 @@ guesses about vectorization.
   two factors — ``{"sqsum": (x, x)}`` — so the fold is one fused
   ``fma(val, scale, acc)``: the product is never rounded on its own (bitwise
   parity with folding the product directly, one FFMA instead of FMUL+FADD).
-  ``outs={name: sink_op}`` is the general form for any sink op
-  (e.g. OnlineLSEReduce's coupled (max, sum) accumulator).
+  ``outs={name: sink_op}`` is the general form for any sink op. A sink declares
+  ``sink_arity``; arity greater than one means the fn returns a tuple of
+  independently collected value planes for the sink to combine.
 * PREPASS: ``prepass=fn2, prepass_outs=(names,)`` runs fn2 over the RAW
   accumulator before any store (driver flag epi_needs_acc_prepass; needs a
   re-readable accumulator — SM90 registers, SM100 tmem with no_release;
@@ -351,10 +352,12 @@ class _FragmentEpiModMixin(_EpiModMixinBase):
             outputs.append(output)
         sink_tmps = []
         for name in self._epi_mod_sinks:
-            value = result[name]
-            sink_tmp = cute.make_rmem_tensor(value.shape, value.element_type)
-            sink_tmp.store(value)
-            sink_tmps.append(sink_tmp)
+            planes = []
+            for value in self._value_planes(name, ops_by_name[name].sink_arity, result[name]):
+                plane = cute.make_rmem_tensor(value.shape, value.element_type)
+                plane.store(value)
+                planes.append(plane)
+            sink_tmps.append(tuple(planes))
         self._flush_sinks(ops_by_name, epi_loop_tensors, tuple(sink_tmps))
         return tuple(outputs)
 
@@ -447,10 +450,20 @@ class EpiMod:
                 raise ValueError(
                     f"sink op for {name!r} must have fn_port == 'sink' and be named {name!r}"
                 )
-            if getattr(op, "scaled", False) and self.mode == "acc_pair":
+            if not isinstance(op.sink_arity, int) or op.sink_arity < 1:
+                raise ValueError(f"sink {name!r}: sink_arity must be a positive integer")
+            if op.sink_arity > 1 and self.mode == "acc_pair":
                 raise ValueError(
-                    f"sink {name!r}: scaled reduces are not supported in acc_pair mode yet "
+                    f"sink {name!r}: multi-plane sinks are not supported in acc_pair mode "
                     "(a tuple return already carries the two lanes there)"
+                )
+        for name in self.prepass_outs:
+            op = self.ops.get(name)
+            if op is None:
+                op = self.sinks.get(name)
+            if op is not None and op.sink_arity > 1:
+                raise ValueError(
+                    f"sink {name!r}: multi-plane sinks are not supported in prepass_outs"
                 )
         sig = inspect.signature(fn)
         params = list(sig.parameters)
@@ -792,7 +805,7 @@ class EpiMod:
             if varlen_m or gather_A or blockscaled or concat_key:
                 raise ValueError("swap_ab: dense non-blockscaled only")
             if not self.supports_swap_ab():
-                raise ValueError("swap_ab requires element mode and orientation-aware epilogue ops")
+                raise ValueError("swap_ab requires element-mode and orientation-aware epilogue ops")
             if ag_args is not None:
                 # With swapped slots kernel-A is the caller's B: the AG gate
                 # would gate the wrong operand (and the wrong M geometry).
